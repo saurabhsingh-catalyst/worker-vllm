@@ -16,6 +16,11 @@ from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.models.protocol import BaseModelPath, LoRAModulePath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 
+try:
+    from vllm.entrypoints.serve.render.serving import OpenAIServingRender
+except ImportError:
+    OpenAIServingRender = None
+
 from constants import DEFAULT_BATCH_SIZE, DEFAULT_BATCH_SIZE_GROWTH_FACTOR, DEFAULT_MAX_CONCURRENCY, DEFAULT_MIN_BATCH_SIZE
 from engine_args import get_engine_args
 from tokenizer import TokenizerWrapper
@@ -152,9 +157,15 @@ class vLLMEngine:
                 last_output_texts[output_index] = output.text
 
         if not stream:
-            for output_index, output in enumerate(last_output_texts):
-                batch["choices"][output_index]["tokens"] = [output]
-            token_counters["batch"] += 1
+            batch = {
+                "choices": [
+                    {"index": i, "text": text}
+                    for i, text in enumerate(last_output_texts)
+                ],
+                "usage": {"input": n_input_tokens, "output": token_counters["total"]},
+            }
+            yield batch
+            return
 
         if token_counters["batch"] > 0:
             batch["usage"] = {"input": n_input_tokens, "output": token_counters["total"]}
@@ -230,6 +241,22 @@ class OpenAIvLLMEngine(vLLMEngine):
             self._engines_initialized = True
             logging.info("OpenAI serving engines initialized successfully")
 
+    @staticmethod
+    def _filter_kwargs(cls, kwargs):
+        """Filter kwargs to only include parameters accepted by the class constructor."""
+        import inspect
+        sig = inspect.signature(cls.__init__)
+        valid_params = set(sig.parameters.keys()) - {'self'}
+        # If **kwargs is accepted, pass everything through
+        for param in sig.parameters.values():
+            if param.kind == inspect.Parameter.VAR_KEYWORD:
+                return kwargs
+        filtered = {k: v for k, v in kwargs.items() if k in valid_params}
+        dropped = set(kwargs.keys()) - set(filtered.keys())
+        if dropped:
+            logging.warning(f"{cls.__name__}: dropping unsupported kwargs: {dropped}")
+        return filtered
+
     async def _initialize_engines(self):
         self.model_config = self.llm.model_config
         self.base_model_paths = [
@@ -242,15 +269,37 @@ class OpenAIvLLMEngine(vLLMEngine):
             lora_modules=self.lora_adapters,
         )
         await self.serving_models.init_static_loras()
-        
+
         # Get chat template from vLLM tokenizer if available
         chat_template = None
         if self.tokenizer and hasattr(self.tokenizer, 'tokenizer'):
             chat_template = self.tokenizer.tokenizer.chat_template
-        
-        self.chat_engine = OpenAIServingChat(
-            engine_client=self.llm, 
+
+        # Build OpenAIServingRender if the newer vLLM version requires it
+        openai_serving_render = None
+        if OpenAIServingRender is not None:
+            render_kwargs = self._filter_kwargs(OpenAIServingRender, dict(
+                model_config=self.model_config,
+                renderer=self.llm.renderer,
+                io_processor=getattr(self.llm, 'io_processor', None),
+                model_registry=self.serving_models.registry,
+                request_logger=None,
+                chat_template=chat_template,
+                chat_template_content_format="auto",
+                trust_request_chat_template=os.getenv('TRUST_REQUEST_CHAT_TEMPLATE', 'false').lower() == 'true',
+                enable_auto_tools=os.getenv('ENABLE_AUTO_TOOL_CHOICE', 'false').lower() == 'true',
+                exclude_tools_when_tool_choice_none=os.getenv('EXCLUDE_TOOLS_WHEN_TOOL_CHOICE_NONE', 'false').lower() == 'true',
+                tool_parser=os.getenv('TOOL_CALL_PARSER', "") or None,
+                reasoning_parser=os.getenv('REASONING_PARSER', "") or None,
+                log_error_stack=os.getenv('LOG_ERROR_STACK', 'false').lower() == 'true',
+            ))
+            openai_serving_render = OpenAIServingRender(**render_kwargs)
+            logging.info("OpenAIServingRender initialized successfully")
+
+        chat_kwargs = self._filter_kwargs(OpenAIServingChat, dict(
+            engine_client=self.llm,
             models=self.serving_models,
+            openai_serving_render=openai_serving_render,
             response_role=self.response_role,
             request_logger=None,
             chat_template=chat_template,
@@ -265,16 +314,20 @@ class OpenAIvLLMEngine(vLLMEngine):
             enable_force_include_usage=os.getenv('ENABLE_FORCE_INCLUDE_USAGE', 'false').lower() == 'true',
             enable_log_outputs=os.getenv('ENABLE_LOG_OUTPUTS', 'false').lower() == 'true',
             log_error_stack=os.getenv('LOG_ERROR_STACK', 'false').lower() == 'true',
-        )
-        self.completion_engine = OpenAIServingCompletion(
+        ))
+        self.chat_engine = OpenAIServingChat(**chat_kwargs)
+
+        completion_kwargs = self._filter_kwargs(OpenAIServingCompletion, dict(
             engine_client=self.llm,
             models=self.serving_models,
+            openai_serving_render=openai_serving_render,
             request_logger=None,
             return_tokens_as_token_ids=os.getenv('RETURN_TOKENS_AS_TOKEN_IDS', 'false').lower() == 'true',
             enable_prompt_tokens_details=os.getenv('ENABLE_PROMPT_TOKENS_DETAILS', 'false').lower() == 'true',
             enable_force_include_usage=os.getenv('ENABLE_FORCE_INCLUDE_USAGE', 'false').lower() == 'true',
             log_error_stack=os.getenv('LOG_ERROR_STACK', 'false').lower() == 'true',
-        )
+        ))
+        self.completion_engine = OpenAIServingCompletion(**completion_kwargs)
 
         if hasattr(self.chat_engine, 'warmup'):
             await self.chat_engine.warmup()

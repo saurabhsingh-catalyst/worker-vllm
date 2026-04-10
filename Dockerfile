@@ -1,17 +1,8 @@
-FROM nvidia/cuda:12.9.1-base-ubuntu22.04 
+FROM vllm/vllm-openai:gemma4-cu130
 
-RUN apt-get update -y \
-    && apt-get install -y python3-pip
+# Install additional Python dependencies
+RUN pip install --no-cache-dir --upgrade transformers==5.5.0 accelerate huggingface_hub runpod httpx
 
-RUN ldconfig /usr/local/cuda-12.9/compat/
-
-# Install vLLM with FlashInfer - use CUDA 12.8 PyTorch wheels (compatible with vLLM 0.15.1)
-RUN python3 -m pip install --upgrade pip && \
-    python3 -m pip install "vllm[flashinfer]==0.16.0" --extra-index-url https://download.pytorch.org/whl/cu129
-
-
-
-# Install additional Python dependencies (after vLLM to avoid PyTorch version conflicts)
 COPY builder/requirements.txt /requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade -r /requirements.txt
@@ -60,5 +51,6 @@ RUN --mount=type=secret,id=HF_TOKEN,required=false \
     python3 /src/download_model.py; \
     fi
 
-# Start the handler
+# Override base image entrypoint and start the handler
+ENTRYPOINT []
 CMD ["python3", "/src/handler.py"]
